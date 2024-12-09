@@ -40,8 +40,8 @@ if __name__ == "__main__":
         snakemake = mock_snakemake(
             "prepare_energy_totals",
             simpl="",
-            clusters=32,
-            demand="EG",
+            clusters=102,
+            demand="AP",
             planning_horizons=2030,
         )
         sets_path_to_root("pypsa-earth-sec")
@@ -51,7 +51,7 @@ if __name__ == "__main__":
     investment_year = int(snakemake.wildcards.planning_horizons)
     demand_sc = snakemake.wildcards.demand  # loading the demand scenrario wildcard
 
-    base_energy_totals = read_csv_nafix("data/energy_totals_base.csv", index_col=0)
+    base_energy_totals = read_csv_nafix(snakemake.input.energy_totals_base, index_col=0)
     growth_factors_cagr = read_csv_nafix(
         snakemake.input.growth_factors_cagr, index_col=0
     )

@@ -54,9 +54,9 @@ if __name__ == "__main__":
         snakemake = mock_snakemake(
             "build_industry_demand",
             simpl="",
-            clusters=10,
-            planning_horizons=2030,
-            demand="AB",
+            clusters=123,
+            planning_horizons=2050,
+            demand="AP",
         )
 
         sets_path_to_root("pypsa-earth-sec")

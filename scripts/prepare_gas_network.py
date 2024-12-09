@@ -36,7 +36,7 @@ if __name__ == "__main__":
         snakemake = mock_snakemake(
             "prepare_gas_network",
             simpl="",
-            clusters="10",
+            clusters="100",
         )
         sets_path_to_root("pypsa-earth-sec")
         rootpath = ".."
@@ -323,6 +323,8 @@ def get_GADM_filename(country_code):
 
     if country_code in special_codes_GADM:
         return f"gadm41_{special_codes_GADM[country_code]}"
+    elif country_code == 'UA':
+        return f"gadm36_{two_2_three_digits_country(country_code)}"
     else:
         return f"gadm41_{two_2_three_digits_country(country_code)}"
 
@@ -344,6 +346,11 @@ def download_GADM(country_code, update=False, out_logging=False):
     """
 
     GADM_filename = get_GADM_filename(country_code)
+
+    if country_code == 'UA':
+        GADM_url = f"https://geodata.ucdavis.edu/gadm/gadm3.6/gpkg/{GADM_filename}_gpkg.zip"
+    else:
+        GADM_url = f"https://geodata.ucdavis.edu/gadm/gadm4.1/gpkg/{GADM_filename}.gpkg"
 
     GADM_inputfile_gpkg = os.path.join(
         os.getcwd() + "/pypsa-earth",
@@ -441,9 +448,14 @@ def get_GADM_layer(
             cur_layer_id = len(list_layers) - 1
 
         # read gpkg file
-        geodf_temp = gpd.read_file(
-            file_gpkg, layer="ADM_ADM_" + str(cur_layer_id)
-        ).to_crs(geo_crs)
+        if country_code == 'UA':
+            geodf_temp = gpd.read_file(
+                file_gpkg, layer="gadm36_UKR_" + str(cur_layer_id)
+            ).to_crs(geo_crs)
+        else:
+            geodf_temp = gpd.read_file(
+                file_gpkg, layer="ADM_ADM_" + str(cur_layer_id)
+            ).to_crs(geo_crs)
 
         geodf_temp = filter_gadm(
             geodf=geodf_temp,
@@ -551,6 +563,11 @@ def load_bus_region(onshore_path, pipelines):
             year,
             nprocesses=nprocesses,
         )
+
+        #------------Only for custom shapes-----TODO Include it in workflow as a PR
+        bus_regions_onshore = gpd.read_file("/nimble/home/edd32710/projects/Paper_1/pypsa-earth-sec/pypsa-earth/resources/shapes/gadm_shapes_none_simplified.geojson")
+        #------------
+
 
         # bus_regions_onshore = bus_regions_onshore.reset_index()
         bus_regions_onshore = bus_regions_onshore.rename(columns={"GADM_ID": "gadm_id"})
@@ -907,14 +924,18 @@ if not snakemake.params.custom_gas_network:
             pipelines, bus_regions_onshore, length_factor=1.25
         )
 
-        # Conversion of GADM id to from 3 to 2-digit
-        pipelines["bus0"] = pipelines["bus0"].apply(
-            lambda id: three_2_two_digits_country(id[:3]) + id[3:]
-        )
+        #-----------------THe following lines were removed only because gadm_shapes_none_simplified was used in the uper part of the code
+        # TODO adapt this to in the PR for including a none simplified version of gadm shapes in build_shapes script
+        
+        # # Conversion of GADM id to from 3 to 2-digit
+        # pipelines["bus0"] = pipelines["bus0"].apply(
+        #     lambda id: three_2_two_digits_country(id[:3]) + id[3:]
+        # )
 
-        pipelines["bus1"] = pipelines["bus1"].apply(
-            lambda id: three_2_two_digits_country(id[:3]) + id[3:]
-        )
+        # pipelines["bus1"] = pipelines["bus1"].apply(
+        #     lambda id: three_2_two_digits_country(id[:3]) + id[3:]
+        # )
+        #-----------------
 
         pipelines.to_csv(snakemake.output.clustered_gas_network, index=False)
 

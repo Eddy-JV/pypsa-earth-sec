@@ -190,6 +190,7 @@ if __name__ == "__main__":
             discountrate="0.071",
             demand="AB",
             h2export="120",
+            esc="shipping_lh2"
         )
         sets_path_to_root("pypsa-earth-sec")
 

@@ -3,6 +3,7 @@
 import logging
 import os
 from pathlib import Path
+import re
 
 import numpy as np
 import pandas as pd
@@ -11,6 +12,7 @@ from helpers import override_component_attrs
 from pypsa.linopf import ilopf, network_lopf
 from pypsa.linopt import define_constraints, get_var, join_exprs, linexpr
 from vresutils.benchmark import memory_logger
+
 
 logger = logging.getLogger(__name__)
 pypsa.pf.logger.setLevel(logging.WARNING)
@@ -152,13 +154,12 @@ def add_battery_constraints(n):
             link_p_nom[dischargers].values,
         ),
     )
-
     define_constraints(n, lhs, "=", 0, "Link", "charger_ratio")
 
 
 def add_h2_network_cap(n, cap):
-    h2_network = n.links.loc[n.links.carrier == "H2 pipeline"]
-    if h2_network.index.empty or ("Link", "p_nom") not in n.variables.index:
+    h2_network = n.links.loc[(n.links.carrier == "H2 pipeline") | (n.links.carrier == "H2 pipeline repurposed")]
+    if h2_network.index.empty or ("Link", "p_nom") not in n.variables.index or (h2_network.p_nom_extendable == False).all():
         return
     h2_network_cap = get_var(n, "Link", "p_nom")
     subset_index = h2_network.index.intersection(h2_network_cap.index)
@@ -172,7 +173,87 @@ def add_h2_network_cap(n, cap):
     ).sum()
     # lhs = linexpr((1, h2_network_cap[h2_network.index])).sum()
     rhs = cap * 1000
+    # print(rhs)
     define_constraints(n, lhs, "<=", rhs, "h2_network_cap")
+
+
+def add_nh3_network_cap(n, cap):
+    nh3_network = n.links.loc[(n.links.carrier == "NH3 pipeline")]
+    if nh3_network.index.empty or ("Link", "p_nom") not in n.variables.index:
+        return
+    nh3_network_cap = get_var(n, "Link", "p_nom")
+    subset_index = nh3_network.index.intersection(nh3_network_cap.index)
+    diff_index = nh3_network_cap.index.difference(subset_index)
+    if len(diff_index) > 0:
+        logger.warning(
+            f"Impossible to set NH3 cap for the following links: {diff_index}"
+        )
+    lhs = linexpr(
+        (nh3_network.loc[subset_index, "length"], nh3_network_cap[subset_index])
+    ).sum()
+    # lhs = linexpr((1, h2_network_cap[h2_network.index])).sum()
+    rhs = cap * 1000
+    # print(rhs)
+    define_constraints(n, lhs, "<=", rhs, "nh3_network_cap")
+
+
+def add_nh3_store_cap(n, cap):
+    nh3_stores = n.stores.loc[(n.stores.carrier == "NH3 store")]
+    if nh3_stores.index.empty or ("Store", "e_nom") not in n.variables.index:
+        return
+    nh3_stores_cap = get_var(n, "Store", "e_nom")
+    subset_index = nh3_stores.index.intersection(nh3_stores.index)
+    diff_index = nh3_stores_cap.index.difference(subset_index)
+    if len(diff_index) > 0:
+        logger.warning(
+            f"Impossible to set NH3 store cap for the following stores: {diff_index}"
+        )
+    lhs = linexpr(
+        (1, nh3_stores_cap[subset_index])
+    ).sum()
+    # lhs = linexpr((1, h2_network_cap[h2_network.index])).sum()
+    rhs = cap * 1000
+    # print(rhs)
+    define_constraints(n, lhs, "<=", rhs, "nh3_stores_cap")
+
+
+
+
+# from pyomo.environ import Constraint
+
+# def define_modular_constraints(n, c, attr):
+#     """
+#     Sets constraints for fixing modular variables of a given component. It
+#     allows defining the optimal capacity of a component as a multiple of the
+#     nominal capacity of the single module.
+
+#     Parameters
+#     ----------
+#     n : pypsa.Network
+#     c : str
+#         name of the network component
+#     attr : str
+#         name of the variable, e.g. 'n_opt'
+#     """
+#     m = n.model
+#     # Filter the components where modular capacity is extendable and mod > 0
+#     mod_i = n.df(c).query(f"{attr}_extendable and ({attr}_mod>0)").index
+
+#     if mod_i.empty:
+#         return
+
+#     # Modular capacity and modularity variables in Pyomo
+#     modularity = getattr(m, f"{c}_n_mod")
+#     modular_capacity = n.df(c)[f"{attr}_mod"].loc[mod_i]
+#     capacity = getattr(m, f"{c}_{attr}").loc[mod_i]
+
+#     # Add constraint for modularity
+#     def modularity_constraint_rule(model, i):
+#         return capacity[i] == modularity[i] * modular_capacity[i]
+
+#     # Add the constraint to the Pyomo model
+#     setattr(m, f"{c}_{attr}_modularity_constraint",
+#             Constraint(mod_i, rule=modularity_constraint_rule))
 
 
 def H2_export_yearly_constraint(n):
@@ -226,7 +307,7 @@ def H2_export_yearly_constraint(n):
     con = define_constraints(n, lhs, ">=", rhs, "H2ExportConstraint", "RESproduction")
 
 
-def monthly_constraints(n, n_ref):
+def hydrogen_temporal_constraint(n, n_ref, time_period):
     res_techs = [
         "csp",
         "rooftop-solar",
@@ -237,20 +318,40 @@ def monthly_constraints(n, n_ref):
         "offwind2",
         "ror",
     ]
+
+    res_stor_techs = ["hydro"]
+
     allowed_excess = snakemake.config["policy_config"]["hydrogen"]["allowed_excess"]
 
-    res_index = n.generators.loc[n.generators.carrier.isin(res_techs)].index
+    res_gen_index = n.generators.loc[n.generators.carrier.isin(res_techs)].index
+    res_stor_index = n.storage_units.loc[
+        n.storage_units.carrier.isin(res_stor_techs)
+    ].index
 
-    weightings = pd.DataFrame(
-        np.outer(n.snapshot_weightings["generators"], [1.0] * len(res_index)),
+    weightings_gen = pd.DataFrame(
+        np.outer(n.snapshot_weightings["generators"], [1.0] * len(res_gen_index)),
         index=n.snapshots,
-        columns=res_index,
+        columns=res_gen_index,
     )
 
-    res = linexpr((weightings, get_var(n, "Generator", "p")[res_index])).sum(
+    res = linexpr((weightings_gen, get_var(n, "Generator", "p")[res_gen_index])).sum(
         axis=1
-    )  # single line sum
-    res = res.groupby(res.index.month).sum()
+    )
+
+    if not res_stor_index.empty:
+        weightings_stor = pd.DataFrame(
+            np.outer(n.snapshot_weightings["generators"], [1.0] * len(res_stor_index)),
+            index=n.snapshots,
+            columns=res_stor_index,
+        )
+        res += linexpr(
+            (weightings_stor, get_var(n, "StorageUnit", "p_dispatch")[res_stor_index])
+        ).sum(axis=1)
+
+    if time_period == "month":
+        res = res.groupby(res.index.month).sum()
+    elif time_period == "year":
+        res = res.groupby(res.index.year).sum()
 
     electrolysis = get_var(n, "Link", "p")[
         n.links.index[n.links.index.str.contains("H2 Electrolysis")]
@@ -267,25 +368,46 @@ def monthly_constraints(n, n_ref):
         axis=1
     )
 
-    elec_input = elec_input.groupby(elec_input.index.month).sum()
+    if time_period == "month":
+        elec_input = elec_input.groupby(elec_input.index.month).sum()
+    elif time_period == "year":
+        elec_input = elec_input.groupby(elec_input.index.year).sum()
 
     if snakemake.config["policy_config"]["hydrogen"]["additionality"]:
-        res_ref = n_ref.generators_t.p[res_index] * weightings
-        res_ref = res_ref.groupby(n_ref.generators_t.p.index.month).sum().sum(axis=1)
+        res_ref_gen = n_ref.generators_t.p[res_gen_index] * weightings_gen
+
+        if not res_stor_index.empty:
+            res_ref_store = n_ref.storage_units_t.p[res_stor_index] * weightings_stor
+            res_ref = pd.concat([res_ref_gen, res_ref_store], axis=1)
+        else:
+            res_ref = res_ref_gen
+
+        if time_period == "month":
+            res_ref = (
+                res_ref.groupby(n_ref.generators_t.p.index.month).sum().sum(axis=1)
+            )
+        elif time_period == "year":
+            res_ref = res_ref.groupby(n_ref.generators_t.p.index.year).sum().sum(axis=1)
 
         elec_input_ref = (
-            n_ref.links_t.p0.loc[
+            -n_ref.links_t.p0.loc[
                 :, n_ref.links_t.p0.columns.str.contains("H2 Electrolysis")
             ]
             * weightings_electrolysis
         )
-        elec_input_ref = (
-            -elec_input_ref.groupby(elec_input_ref.index.month).sum().sum(axis=1)
-        )
+        if time_period == "month":
+            elec_input_ref = (
+                -elec_input_ref.groupby(elec_input_ref.index.month).sum().sum(axis=1)
+            )
+        elif time_period == "year":
+            elec_input_ref = (
+                -elec_input_ref.groupby(elec_input_ref.index.year).sum().sum(axis=1)
+            )
 
         for i in range(len(res.index)):
             lhs = res.iloc[i] + "\n" + elec_input.iloc[i]
-            rhs = res_ref.iloc[i] + elec_input_ref.iloc[i]
+            rhs = res_ref.iloc[i].sum() + elec_input_ref.iloc[i].sum()
+            print(lhs, rhs)
             con = define_constraints(
                 n, lhs, ">=", rhs, f"RESconstraints_{i}", f"REStarget_{i}"
             )
@@ -293,12 +415,90 @@ def monthly_constraints(n, n_ref):
     else:
         for i in range(len(res.index)):
             lhs = res.iloc[i] + "\n" + elec_input.iloc[i]
+            print(lhs, rhs)
 
             con = define_constraints(
                 n, lhs, ">=", 0.0, f"RESconstraints_{i}", f"REStarget_{i}"
             )
     # else:
     #     logger.info("ignoring H2 export constraint as wildcard is set to 0")
+
+
+
+# def monthly_constraints(n, n_ref):
+#     res_techs = [
+#         "csp",
+#         "rooftop-solar",
+#         "solar",
+#         "onwind",
+#         "onwind2",
+#         "offwind",
+#         "offwind2",
+#         "ror",
+#     ]
+#     allowed_excess = snakemake.config["policy_config"]["hydrogen"]["allowed_excess"]
+
+#     res_index = n.generators.loc[n.generators.carrier.isin(res_techs)].index
+
+#     weightings = pd.DataFrame(
+#         np.outer(n.snapshot_weightings["generators"], [1.0] * len(res_index)),
+#         index=n.snapshots,
+#         columns=res_index,
+#     )
+
+#     res = linexpr((weightings, get_var(n, "Generator", "p")[res_index])).sum(
+#         axis=1
+#     )  # single line sum
+#     res = res.groupby(res.index.month).sum()
+
+#     electrolysis = get_var(n, "Link", "p")[
+#         n.links.index[n.links.index.str.contains("H2 Electrolysis")]
+#     ]
+#     weightings_electrolysis = pd.DataFrame(
+#         np.outer(
+#             n.snapshot_weightings["generators"], [1.0] * len(electrolysis.columns)
+#         ),
+#         index=n.snapshots,
+#         columns=electrolysis.columns,
+#     )
+
+#     elec_input = linexpr((-allowed_excess * weightings_electrolysis, electrolysis)).sum(
+#         axis=1
+#     )
+
+#     elec_input = elec_input.groupby(elec_input.index.month).sum()
+
+#     if snakemake.config["policy_config"]["hydrogen"]["additionality"]:
+#         res_ref = n_ref.generators_t.p[res_index] * weightings
+#         res_ref = res_ref.groupby(n_ref.generators_t.p.index.month).sum().sum(axis=1)
+
+#         elec_input_ref = (
+#             n_ref.links_t.p0.loc[
+#                 :, n_ref.links_t.p0.columns.str.contains("H2 Electrolysis")
+#             ]
+#             * weightings_electrolysis
+#         )
+#         elec_input_ref = (
+#             -elec_input_ref.groupby(elec_input_ref.index.month).sum().sum(axis=1)
+#         )
+
+#         for i in range(len(res.index)):
+#             lhs = res.iloc[i] + "\n" + elec_input.iloc[i]
+#             rhs = res_ref.iloc[i] + elec_input_ref.iloc[i]
+#             con = define_constraints(
+#                 n, lhs, ">=", rhs, f"RESconstraints_{i}", f"REStarget_{i}"
+#             )
+
+#     else:
+#         for i in range(len(res.index)):
+#             lhs = res.iloc[i] + "\n" + elec_input.iloc[i]
+
+#             con = define_constraints(
+#                 n, lhs, ">=", 0.0, f"RESconstraints_{i}", f"REStarget_{i}"
+#             )
+#     # else:
+#     #     logger.info("ignoring H2 export constraint as wildcard is set to 0")
+
 
 
 def add_chp_constraints(n):
@@ -365,8 +565,9 @@ def add_chp_constraints(n):
             ),
             (-n.links.loc[electric, "efficiency"].values, link_p[electric].values),
         )
-
+    
         define_constraints(n, lhs, "<=", 0, "chplink", "backpressure")
+    # print(rhs)
 
 
 def add_co2_sequestration_limit(n, sns):
@@ -378,9 +579,18 @@ def add_co2_sequestration_limit(n, sns):
     vars_final_co2_stored = get_var(n, "Store", "e").loc[sns[-1], co2_stores]
 
     lhs = linexpr((1, vars_final_co2_stored)).sum()
-    rhs = (
-        n.config["sector"].get("co2_sequestration_potential", 5) * 1e6
-    )  # TODO change 200 limit (Europe)
+
+    if snakemake.config["sector"]["hydrogen"]["underground_storage"]:
+        if snakemake.config["custom_data"]["co2_underground"]: 
+            rhs = (
+                n.stores.loc[(n.stores.carrier.str.contains("co2 stored"))].e_nom_max.sum()
+            )
+    else:    
+        rhs = (
+            n.config["sector"].get("co2_sequestration_potential", 5) * 1e6
+        )  # TODO change 200 limit (Europe)
+
+    # print(rhs)
 
     name = "co2_sequestration_limit"
     define_constraints(
@@ -437,40 +647,335 @@ def set_h2_colors(n):
     define_constraints(n, total_pink, "=", rhs_pink, "pink_h2_share")
 
 
+
+# def add_lossy_bidirectional_link_constraints(n):
+#     if not n.links.p_nom_extendable.any() or not "reversed" in n.links.columns:
+#         return
+
+#     # Ensure 'reversed' column is boolean
+#     n.links["reversed"] = n.links.reversed.fillna(0).astype(bool)
+#     carriers = n.links.loc[n.links.reversed, "carrier"].unique()
+
+#     # Get forward and backward link indices
+#     forward_i = n.links.query(
+#         "carrier in @carriers and ~reversed and p_nom_extendable"
+#     ).index
+
+#     def get_backward_i(forward_i):
+#         return pd.Index(
+#             [
+#                 re.sub(r"-(\d{4})$", r"-reversed-\1", s)
+#                 if re.search(r"-\d{4}$", s)
+#                 else s + "-reversed"
+#                 for s in forward_i
+#             ]
+#         )
+
+#     backward_i = get_backward_i(forward_i)
+
+#     # Get the p_nom optimization variables for the links using the get_var function
+#     links_p_nom = get_var(n, "Link", "p_nom")
+
+#     ### Right-hand side (forward links) ###
+#     subset_forward = forward_i.intersection(links_p_nom.index)
+#     subset_backward = backward_i.intersection(links_p_nom.index)
+#     print(len(subset_forward))
+#     print(len(subset_backward))
+#     print(len(links_p_nom.loc[subset_forward]))
+#     print(len(links_p_nom.loc[subset_backward]))
+
+#     # Ensure that both forward and backward indices are aligned in length
+#     if len(subset_forward) != len(subset_backward):
+#         raise ValueError("Mismatch between forward and backward links.")
+
+#     # Construct the LHS and RHS expressions for all the constraints at once
+#     lhs = linexpr((1, links_p_nom.loc[subset_backward]))  # LHS (backward)
+#     rhs = linexpr((-1, links_p_nom.loc[subset_forward]))  # RHS (forward) with -1 coefficient
+#     print(lhs)
+#     print(rhs)
+
+#     # Define constraints for all forward-backward pairs at once
+#     define_constraints(
+#         n,
+#         lhs + rhs,  # LHS - RHS = 0 (lhs and rhs combined into one expression)
+#         "=",
+#         0,  # We want LHS to be equal to RHS, so the right-hand side is 0
+#         name="Link",
+#         attr="bidirectional_sync",  # Constraint attribute
+#         axes=[subset_forward]  # Ensure the axes match forward link indices
+#     )
+
+
+def add_lossy_bidirectional_link_constraints(n):
+    """
+        Ensures that the two links simulating a bidirectional_link are extended the same amount.
+    """
+    if not n.links.p_nom_extendable.any() or "reversed" not in n.links.columns:
+        return
+
+    # Ensure 'reversed' column is boolean
+    n.links["reversed"] = n.links.reversed.fillna(0).astype(bool)
+    carriers = n.links.loc[n.links.reversed, "carrier"].unique()
+
+    # Get forward link indices (non-reversed)
+    forward_i = n.links.query(
+        "carrier in @carriers and ~reversed and p_nom_extendable"
+    ).index
+
+    # Function to get backward (reversed) indices corresponding to forward links
+    def get_backward_i(forward_i):
+        return pd.Index(
+            [
+                re.sub(r"-(\d{4})$", r"-reversed-\1", s)
+                if re.search(r"-\d{4}$", s)
+                else s + "-reversed"
+                for s in forward_i
+            ]
+        )
+
+    backward_i = get_backward_i(forward_i)
+
+    # Get the p_nom optimization variables for the links using the get_var function
+    links_p_nom = get_var(n, "Link", "p_nom")
+
+    # Only consider forward and backward links that are present in the optimization variables
+    subset_forward = forward_i.intersection(links_p_nom.index)
+    subset_backward = backward_i.intersection(links_p_nom.index)
+
+    # Ensure we have a matching number of forward and backward links
+    if len(subset_forward) != len(subset_backward):
+        raise ValueError("Mismatch between forward and backward links.")
+
+    # For each forward index, find the corresponding backward index and define the constraint
+    for fwd, bwd in zip(subset_forward, subset_backward):
+        lhs = linexpr((1, links_p_nom.loc[bwd]))  # LHS (backward link)
+        rhs = linexpr((-1, links_p_nom.loc[fwd]))  # RHS (forward link with -1 coefficient)
+
+        # Define the constraint for this pair of forward-backward link
+        define_constraints(
+            n,
+            lhs + rhs,  # LHS - RHS = 0 (equality constraint)
+            "=",
+            0,  # Right-hand side is 0 because we want them to be equal
+            name="Link",
+            attr=f"bidirectional_sync_{fwd}",  # Custom name for this constraint (per pair)
+            axes=[pd.Index([fwd])]  # The axes refer to the forward link
+        )
+
+
+
+
+
+
+# def add_lossy_bidirectional_link_constraints(n):
+#     if not n.links.p_nom_extendable.any() or not "reversed" in n.links.columns:
+#         return
+
+#     n.links["reversed"] = n.links.reversed.fillna(0).astype(bool)
+#     carriers = n.links.loc[n.links.reversed, "carrier"].unique()
+
+#     forward_i = n.links.query(
+#         "carrier in @carriers and ~reversed and p_nom_extendable"
+#     ).index
+
+#     def get_backward_i(forward_i):
+#         return pd.Index(
+#             [
+#                 re.sub(r"-(\d{4})$", r"-reversed-\1", s)
+#                 if re.search(r"-\d{4}$", s)
+#                 else s + "-reversed"
+#                 for s in forward_i
+#             ]
+#         )
+
+#     backward_i = get_backward_i(forward_i)
+
+#     # Get the p_nom optimization variables for the links
+#     links_p_nom = get_var(n, "Link", "p_nom")
+
+#     ### Right-hand side (forward links) ###
+#     subset_forward = forward_i.intersection(links_p_nom.index)
+#     if len(forward_i.difference(subset_forward)) > 0:
+#         print(f"Warning: Some forward links are missing in the model: {forward_i.difference(subset_forward)}")
+
+
+#     lhs = links_p_nom.loc[backward_i]
+#     rhs = links_p_nom.loc[forward_i]
+#     print(lhs)
+#     print(rhs)
+
+#     define_constraints(n, lhs, "=", rhs, name="Link-bidirectional_sync")
+
+#     # # Linear expression for forward links' nominal capacities
+#     # rhs = linexpr((1, links_p_nom.loc[subset_forward]))
+ 
+
+#     # ### Left-hand side (backward links) ###
+#     # subset_backward = backward_i.intersection(links_p_nom.index)
+#     # lhs = linexpr((1, links_p_nom.loc[subset_backward]))
+
+#     # ### Manually align lhs and rhs based on forward_i ###
+#     # # Use reindex to align lhs with forward indices (rhs)
+#     # lhs_aligned = lhs.reindex(subset_forward)
+#     # rhs_aligned = rhs
+
+#     # print(lhs_aligned)
+#     # print(rhs_aligned)
+
+#     # # Ensure there are no NaN values in lhs after reindexing
+#     # if lhs_aligned.isnull().any():
+#     #     raise ValueError("Some reversed links are missing corresponding forward links!")
+
+#     # # Apply the constraint: p_nom of forward link should equal p_nom of reversed link
+#     # define_constraints(n, lhs_aligned, "=", rhs_aligned, name="Link-bidirectional_sync")
+
+
+#     # print(subset_backward)
+#     # if len(backward_i.difference(subset_backward)) > 0:
+#     #     print(f"Warning: Some backward links are missing in the model: {backward_i.difference(subset_backward)}")
+
+#     # # Linear expression for backward links' nominal capacities
+#     # lhs = linexpr((1, links_p_nom.loc[subset_backward]))
+#     # print(lhs)
+
+#     # # Add the constraint to synchronize forward and backward nominal capacities
+#     # define_constraints(n, lhs, "=", rhs, name="Link-bidirectional_sync")
+
+#     # # lhs = n.model["Link-p_nom"].loc[backward_i]
+#     # # rhs = n.model["Link-p_nom"].loc[forward_i]
+
+#     # # lhs = n.links["p_nom"].loc[backward_i]
+#     # # rhs = n.links["p_nom"].loc[forward_i]
+
+#     # links_p_nom = get_var(n, "Link", "p_nom")
+
+#     # subset_index = forward_i.intersection(links_p_nom.index)
+#     # diff_index = links_p_nom.index.difference(subset_index)
+#     # # if len(diff_index) > 0:
+#     # #     logger.warning(
+#     # #         f"Impossible to set NH3 store cap for the following stores: {diff_index}"
+#     # #     )
+#     # rhs = linexpr((1, links_p_nom[subset_index]))
+
+#     # subset_index = backward_i.intersection(links_p_nom.index)
+#     # diff_index = links_p_nom.index.difference(subset_index)
+#     # # if len(diff_index) > 0:
+#     # #     logger.warning(
+#     # #         f"Impossible to set NH3 store cap for the following stores: {diff_index}"
+#     # #     )
+
+#     # lhs = linexpr((1, links_p_nom[subset_index]))
+
+#     # print(links_p_nom.index)
+#     # print(n.links.index)
+
+#     # # lhs = linexpr((1, links_p_nom[backward_i]))
+#     # # rhs = linexpr((1, links_p_nom[forward_i]))
+
+#     # # n.model.add_constraints(lhs == rhs, name="Link-bidirectional_sync")
+#     # define_constraints(n, lhs, "=", rhs, name="Link-bidirectional_sync")
+
+
+
+# def extra_functionality(n, snapshots):
+#     add_battery_constraints(n)
+#     add_lossy_bidirectional_link_constraints(n)
+
+#     if (
+#         snakemake.config["policy_config"]["hydrogen"]["temporal_matching"]
+#         == "h2_yearly_matching"
+#     ):
+#         if snakemake.config["policy_config"]["hydrogen"]["additionality"] == True:
+#             logger.info(
+#                 "additionality is currently not supported for yearly constraints, proceeding without additionality"
+#             )
+#         logger.info("setting h2 export to yearly greenness constraint")
+#         H2_export_yearly_constraint(n)
+
+#     elif (
+#         snakemake.config["policy_config"]["hydrogen"]["temporal_matching"]
+#         == "h2_monthly_matching"
+#     ):
+#         if not snakemake.config["policy_config"]["hydrogen"]["is_reference"]:
+#             logger.info("setting h2 export to monthly greenness constraint")
+#             monthly_constraints(n, n_ref)
+#         else:
+#             logger.info("preparing reference case for additionality constraint")
+
+#     elif (
+#         snakemake.config["policy_config"]["hydrogen"]["temporal_matching"]
+#         == "no_res_matching"
+#     ):
+#         logger.info("no h2 export constraint set")
+
+#     else:
+#         raise ValueError(
+#             'H2 export constraint is invalid, check config["policy_config"]'
+#         )
+
+#     if snakemake.config["sector"]["hydrogen"]["network"]:
+#         if snakemake.config["sector"]["hydrogen"]["network_limit"]:
+#             add_h2_network_cap(
+#                 n, snakemake.config["sector"]["hydrogen"]["network_limit"]
+#             )
+
+#     if snakemake.config["export"]["esc_scenarios"]["synthesis"] == 'free': # TODO change it to snakemake.config["sector"]["ammonia"]["network"] if necessary in the future
+#         if snakemake.config["sector"]["ammonia"]["network_limit"]:
+#             add_nh3_network_cap(
+#                 n, snakemake.config["sector"]["ammonia"]["network_limit"]
+#             )
+
+#     # if snakemake.config["export"]["esc_scenarios"]["synthesis"] == 'free': # TODO change it to snakemake.config["sector"]["ammonia"]["network"] if necessary in the future
+#     if snakemake.config["sector"]["ammonia"]["storage_limit"] >= 0:
+#         add_nh3_store_cap(
+#             n, snakemake.config["sector"]["ammonia"]["storage_limit"]
+#         )
+
+    
+
+#     # if snakemake.config["export"]["esc_scenarios"]:
+#     #     n.stores.loc[n.stores.index.str.contains('cargo'), 'e_nom_mod'] = 53000
+#     #     define_modular_constraints(n, c, attr)
+
+#     if snakemake.config["sector"]["hydrogen"]["set_color_shares"]:
+#         logger.info("setting H2 color mix")
+#         set_h2_colors(n)
+
+#     add_co2_sequestration_limit(n, snapshots)
+
+
 def extra_functionality(n, snapshots):
     add_battery_constraints(n)
+    add_lossy_bidirectional_link_constraints(n)
 
-    if (
-        snakemake.config["policy_config"]["hydrogen"]["temporal_matching"]
-        == "h2_yearly_matching"
-    ):
-        if snakemake.config["policy_config"]["hydrogen"]["additionality"] == True:
-            logger.info(
-                "additionality is currently not supported for yearly constraints, proceeding without additionality"
-            )
-        logger.info("setting h2 export to yearly greenness constraint")
-        H2_export_yearly_constraint(n)
+    additionality = snakemake.config["policy_config"]["hydrogen"]["additionality"]
+    ref_for_additionality = snakemake.config["policy_config"]["hydrogen"][
+        "is_reference"
+    ]
+    temportal_matching_period = snakemake.config["policy_config"]["hydrogen"][
+        "temporal_matching"
+    ]
 
-    elif (
-        snakemake.config["policy_config"]["hydrogen"]["temporal_matching"]
-        == "h2_monthly_matching"
-    ):
-        if not snakemake.config["policy_config"]["hydrogen"]["is_reference"]:
-            logger.info("setting h2 export to monthly greenness constraint")
-            monthly_constraints(n, n_ref)
-        else:
+    if temportal_matching_period == "no_temporal_matching":
+        logger.info("no h2 temporal constraint set")
+
+    elif additionality:
+        if ref_for_additionality:
             logger.info("preparing reference case for additionality constraint")
-
-    elif (
-        snakemake.config["policy_config"]["hydrogen"]["temporal_matching"]
-        == "no_res_matching"
-    ):
-        logger.info("no h2 export constraint set")
-
-    else:
-        raise ValueError(
-            'H2 export constraint is invalid, check config["policy_config"]'
+        else:
+            logger.info(
+                "setting h2 export to {}ly matching constraint with additionality".format(
+                    temportal_matching_period
+                )
+            )
+            hydrogen_temporal_constraint(n, n_ref, temportal_matching_period)
+    elif not additionality:
+        logger.info(
+            "setting h2 export to {}ly matching constraint without additionality".format(
+                temportal_matching_period
+            )
         )
+        hydrogen_temporal_constraint(n, n_ref, temportal_matching_period)
 
     if snakemake.config["sector"]["hydrogen"]["network"]:
         if snakemake.config["sector"]["hydrogen"]["network_limit"]:
@@ -478,11 +983,50 @@ def extra_functionality(n, snapshots):
                 n, snakemake.config["sector"]["hydrogen"]["network_limit"]
             )
 
+    if snakemake.config["export"]["esc_scenarios"]["synthesis"] == 'free': # TODO change it to snakemake.config["sector"]["ammonia"]["network"] if necessary in the future
+        if snakemake.config["sector"]["ammonia"]["network_limit"]:
+            add_nh3_network_cap(
+                n, snakemake.config["sector"]["ammonia"]["network_limit"]
+            )
+
+    # if snakemake.config["export"]["esc_scenarios"]["synthesis"] == 'free': # TODO change it to snakemake.config["sector"]["ammonia"]["network"] if necessary in the future
+    if snakemake.config["sector"]["ammonia"]["storage_limit"] >= 0:
+        add_nh3_store_cap(
+            n, snakemake.config["sector"]["ammonia"]["storage_limit"]
+        )
+
+    
+
+    # if snakemake.config["export"]["esc_scenarios"]:
+    #     n.stores.loc[n.stores.index.str.contains('cargo'), 'e_nom_mod'] = 53000
+    #     define_modular_constraints(n, c, attr)
+
     if snakemake.config["sector"]["hydrogen"]["set_color_shares"]:
         logger.info("setting H2 color mix")
         set_h2_colors(n)
 
     add_co2_sequestration_limit(n, snapshots)
+
+    #-----------------
+    # components=[
+    #     "links",
+    #     "generators",
+    #     "stores", 
+    #     "storage_units"] #TODO uncomment after adding storage units
+    # for comp in components:
+    #     df_c = getattr(n, comp)
+    #     attr = "e_nom_opt" if comp == "stores" else "p_nom_opt"
+    #     attr_nom = "e_nom" if comp == "stores" else "p_nom"
+        
+    #     if any("<=" in col for col in df_c.columns):
+    #         print("Warning: '<=' found in column names.")
+
+    #     # Check if "<=" is in any values in the DataFrame
+    #     if df_c.applymap(lambda x: isinstance(x, str) and "<=" in x).any().any():
+    #         print("Warning: '<=' found in DataFrame values.")
+    #     # get_var(n, comp, df_c[attr_nom], pop=False)
+    # print('finished')
+    #-----------------
 
 
 def solve_network(n, config, opts="", **kwargs):
@@ -537,18 +1081,84 @@ def add_existing(n):
         existing_electrolyzers = df.p_nom_opt.values
 
         h2_index = n.links[n.links.carrier == "H2 Electrolysis"].index
+        n.links.loc[h2_index, "p_nom"] = existing_electrolyzers
         n.links.loc[h2_index, "p_nom_min"] = existing_electrolyzers
 
-        # n_name = snakemake.input.network.split("/")[-1].replace(str(snakemake.config["scenario"]["clusters"][0]), "").\
-        #     replace(".nc", ".csv").replace(str(snakemake.config["costs"]["discountrate"][0]), "")
+        df = pd.read_csv(directory + "pipeline_caps_" + n_name, index_col=0)
+        if df.shape != (0,1):
+            existing_h2_index_ppl = df.p_nom_opt.index #-----Added for Canada to include new h2 pipelines for 2050 runs
+            existing_pipelines = df.p_nom_opt.values
+
+            h2_index_ppl = n.links[n.links.carrier == "H2 pipeline"].index
+            # n.links.loc[h2_index_ppl, "p_nom"] = existing_pipelines
+            # n.links.loc[h2_index_ppl, "p_nom_min"] = existing_pipelines
+            n.links.loc[existing_h2_index_ppl, "p_nom"] = existing_pipelines#-----Changed for Canada to include new h2 pipelines for 2050 runs
+            n.links.loc[existing_h2_index_ppl, "p_nom_min"] = existing_pipelines#-----Changed for Canada to include new h2 pipelines for 2050 runs
+            
         df = pd.read_csv(directory + "/res_caps_" + n_name, index_col=0)
 
         for tech in snakemake.config["custom_data"]["renewables"]:
-            # df = pd.read_csv(snakemake.config["custom_data"]["existing_renewables"], index_col=0)
-            existing_res = df.loc[tech]
-            existing_res.index = existing_res.index.str.apply(lambda x: x + tech)
-            tech_index = n.generators[n.generators.carrier == tech].index
-            n.generators.loc[tech_index, tech] = existing_res
+            if tech == 'onwind2' or tech == 'offwind2':
+                step_0 = df.loc[:,tech[:-1]]
+                tech_index_0 = n.generators[n.generators.carrier == tech[:-1]].index
+                diff = n.generators.loc[tech_index_0, "p_nom_max"] - n.generators.loc[tech_index_0, "p_nom_min"]
+                diff = diff[diff < 0]
+                n.generators.loc[diff.index, "p_nom_min"] += diff
+                n.generators.loc[diff.index, "p_nom"] += diff
+                print('Discarded {} GW of existing {} capacities'.format(-diff.sum()/1e3, tech.strip('2')))
+
+                # df = pd.read_csv(snakemake.config["custom_data"]["existing_renewables"], index_col=0)
+                existing_res = df.loc[:,tech]
+                existing_res.index = existing_res.index.to_series().apply(lambda x: x + " " + tech)
+                tech_index = n.generators[n.generators.carrier == tech].index
+                diff.index = diff.index + "2"
+
+                n.generators.loc[tech_index, "p_nom"] = existing_res
+                n.generators.loc[diff.index, "p_nom"] -= diff
+                n.generators.loc[tech_index, "p_nom_min"] = existing_res
+                n.generators.loc[diff.index, "p_nom_min"] -= diff
+
+                diff_2 = n.generators.loc[tech_index, "p_nom_max"] - n.generators.loc[tech_index, "p_nom_min"]
+                diff_2 = diff_2[diff_2 < 0]
+                n.generators.loc[diff_2.index, "p_nom"] += diff_2
+                n.generators.loc[diff_2.index, "p_nom_min"] += diff_2
+                print('Discarded {} GW of existing {} capacities'.format(-diff_2.sum()/1e3, tech))
+            else: 
+                # df = pd.read_csv(snakemake.config["custom_data"]["existing_renewables"], index_col=0)
+                existing_res = df.loc[:,tech]
+                existing_res.index = existing_res.index.to_series().apply(lambda x: x + " " + tech)
+                tech_index = n.generators[n.generators.carrier == tech].index
+                n.generators.loc[tech_index, "p_nom"] = existing_res
+                n.generators.loc[tech_index, "p_nom_min"] = existing_res
+
+                if tech != 'onwind' or tech != 'offwind':
+                    diff = n.generators.loc[tech_index, "p_nom_max"] - n.generators.loc[tech_index, "p_nom_min"]
+                    diff = diff[diff < 0]
+                    n.generators.loc[diff.index, "p_nom_min"] += diff
+                    n.generators.loc[diff.index, "p_nom"] += diff
+                    print('Discarded {} GW of existing {} capacities'.format(-diff.sum()/1e3, tech))
+
+
+        # import ruamel.yaml
+        # # Read the YAML file
+        # yaml = ruamel.yaml.YAML()
+        # # Load the configuration file specific to the subworkflow
+        # config_file_path = "./config.pypsa-earth.yaml"  # Adjust the path accordingly
+
+        # with open(config_file_path, 'r') as f:
+        #     subworkflow_config = yaml.load(f)
+
+        # # Access the extendable_carriers information from the subworkflow config
+        # if "geothermal" in subworkflow_config["electricity"]["extendable_carriers"]["Generator"]:
+        #     df = pd.read_csv(directory + "/geothermal_caps_" + n_name, index_col=0)
+
+        #     for tech in  subworkflow_config["electricity"]["extendable_carriers"]["Generator"]:
+                if tech == 'geothermal':
+                    existing_res = df.p_nom_opt.values # df.loc[:,'p_nom_opt']
+                    tech_index = n.generators[n.generators.carrier == tech].index
+                    n.generators.loc[tech_index, "p_nom"] = existing_res
+                    n.generators.loc[tech_index, "p_nom_min"] = existing_res
+
 
 
 if __name__ == "__main__":
@@ -559,14 +1169,15 @@ if __name__ == "__main__":
         snakemake = mock_snakemake(
             "solve_network",
             simpl="",
-            clusters="18",
-            ll="c1.0",
+            clusters="430",
+            ll="v1.1",
             opts="Co2L",
-            planning_horizons="2030",
-            sopts="24H",
-            discountrate=0.071,
-            demand="AB",
+            planning_horizons="2050",
+            sopts="3H",
+            discountrate=0.091,
+            demand="AP",
             h2export="0",
+            esc="shipping_lnh3"
         )
 
         sets_path_to_root("pypsa-earth-sec")
@@ -602,6 +1213,45 @@ if __name__ == "__main__":
             n_ref = pypsa.Network(n_ref_path)
         else:
             n_ref = None
+
+        # #-------------------------
+
+
+
+        # n.links["reversed"] = n.links.reversed.fillna(0).astype(bool)
+        # carriers = n.links.loc[n.links.reversed, "carrier"].unique()
+
+        # forward_i = n.links.query(
+        #     "carrier in @carriers and ~reversed and p_nom_extendable"
+        # ).index
+
+        # def get_backward_i(forward_i):
+        #     return pd.Index(
+        #         [
+        #             re.sub(r"-(\d{4})$", r"-reversed-\1", s)
+        #             if re.search(r"-\d{4}$", s)
+        #             else s + "-reversed"
+        #             for s in forward_i
+        #         ]
+        #     )
+
+        # backward_i = get_backward_i(forward_i)
+
+        # # Get the p_nom optimization variables for the links
+        # links_p_nom = get_var(n, "Link", "p_nom")
+
+        # ### Right-hand side (forward links) ###
+        # subset_forward = forward_i.intersection(links_p_nom.index)
+        # if len(forward_i.difference(subset_forward)) > 0:
+        #     print(f"Warning: Some forward links are missing in the model: {forward_i.difference(subset_forward)}")
+
+
+        # lhs = links_p_nom.loc[backward_i]
+        # rhs = links_p_nom.loc[forward_i]
+        # print(lhs)
+        # print(rhs)
+
+        # #------------------
 
         n = prepare_network(n, solve_opts)
 

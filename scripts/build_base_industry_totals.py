@@ -119,7 +119,7 @@ if __name__ == "__main__":
     clean_industry_list = list(transaction.clean_name.unique())
 
     unsd_path = (
-        os.path.dirname(snakemake.input["energy_totals_base"]) + "/demand/unsd/data/"
+        os.path.dirname(snakemake.input["energy_totals"]) + "/demand/unsd/data/"
     )
 
     # Get the files from the path provided in the OP

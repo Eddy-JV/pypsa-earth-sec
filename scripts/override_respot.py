@@ -25,15 +25,16 @@ def override_values(tech, year, dr):
             index_col=0,
         )
         .filter(buses, axis=0)
-        .reset_index()
+        .reset_index().rename(columns={'index': 'Generator'})
     )
 
-    custom_res["Generator"] = custom_res["Generator"].apply(lambda x: x + " " + tech)
+    # custom_res["Generator"] = custom_res["Generator"].apply(lambda x: x + " " + tech)
     custom_res = custom_res.set_index("Generator")
 
-    if tech.replace("-", " ") in n.generators.carrier.unique():
-        to_drop = n.generators[n.generators.carrier == tech].index
-        n.mremove("Generator", to_drop)
+    # if tech.replace("-", " ") in n.generators.carrier.unique():
+    #     existing_res_workflow = n.generators[n.generators.carrier == tech].p_nom.values
+    #     to_drop = n.generators[n.generators.carrier == tech].index
+    #     n.mremove("Generator", to_drop)
 
     if snakemake.wildcards["planning_horizons"] == 2050:
         directory = "results/" + snakemake.params.run.replace("2050", "2030")
@@ -44,8 +45,18 @@ def override_values(tech, year, dr):
         # df = pd.read_csv(snakemake.config["custom_data"]["existing_renewables"], index_col=0)
         existing_res = df.loc[tech]
         existing_res.index = existing_res.index.str.apply(lambda x: x + tech)
+    elif ((snakemake.wildcards["planning_horizons"] == 2030) and (tech.replace("-", " ") in n.generators.carrier.unique())):
+        existing_res_workflow = n.generators[n.generators.carrier == tech].p_nom#.values
+        existing_res_workflow.index = existing_res_workflow.index.str.rstrip(f' {tech}')
+        existing_res = pd.Series(0, index=buses)
+        existing_res.update(existing_res_workflow)
     else:
-        existing_res = custom_res["installedcapacity"].values
+        existing_res = custom_res["installedcapacity"]#.values
+
+
+    if tech.replace("-", " ") in n.generators.carrier.unique():
+        to_drop = n.generators[n.generators.carrier == tech].index
+        n.mremove("Generator", to_drop)
 
     n.madd(
         "Generator",
@@ -54,13 +65,14 @@ def override_values(tech, year, dr):
         bus=buses,
         carrier=tech,
         p_nom_extendable=True,
-        p_nom_max=custom_res["p_nom_max"].values,
+        p_nom_max=custom_res["p_nom_max"], # .values
         # weight=ds["weight"].to_pandas(),
         # marginal_cost=custom_res["fixedomEuroPKW"].values * 1000,
-        capital_cost=custom_res["annualcostEuroPMW"].values,
+        capital_cost=custom_res["annualcostEuroPMW"], # .values
         efficiency=1.0,
         p_max_pu=custom_res_t,
         lifetime=custom_res["lifetime"][0],
+        p_nom=existing_res,
         p_nom_min=existing_res,
     )
 
@@ -72,13 +84,13 @@ if __name__ == "__main__":
         snakemake = mock_snakemake(
             "override_respot",
             simpl="",
-            clusters="16",
+            clusters="141",
             ll="c1.0",
             opts="Co2L",
-            planning_horizons="2030",
+            planning_horizons=2030,
             sopts="3H",
             demand="AP",
-            discountrate=0.071,
+            discountrate=0.10,
         )
         sets_path_to_root("pypsa-earth-sec")
 
@@ -97,20 +109,21 @@ if __name__ == "__main__":
             m = n.copy()
 
             for tech in techs:
+                print(tech)
                 override_values(tech, year, dr)
 
         else:
             print("No RES potential techs to override...")
 
-        if snakemake.params.custom_data["elec_demand"]:
-            for country in countries:
-                n.loads_t.p_set.filter(like=country)[buses] = (
-                    (
-                        n.loads_t.p_set.filter(like=country)[buses]
-                        / n.loads_t.p_set.filter(like=country)[buses].sum().sum()
-                    )
-                    * energy_totals.loc[country, "electricity residential"]
-                    * 1e6
-                )
+        # if snakemake.params.custom_data["elec_demand"]:
+        #     for country in countries:
+        #         n.loads_t.p_set.filter(like=country)[buses] = (
+        #             (
+        #                 n.loads_t.p_set.filter(like=country)[buses]
+        #                 / n.loads_t.p_set.filter(like=country)[buses].sum().sum()
+        #             )
+        #             * energy_totals.loc[country, "electricity residential"]
+        #             * 1e6
+        #         )
 
     n.export_to_netcdf(snakemake.output[0])

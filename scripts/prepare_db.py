@@ -28,19 +28,21 @@ import pypsa
 
 if __name__ == "__main__":
     if "snakemake" not in globals():
+        os.chdir(os.path.dirname(os.path.abspath(__file__)))
         from helpers import mock_snakemake
 
         snakemake = mock_snakemake(
             "prepare_db",
             simpl="",
-            clusters="244",
+            clusters="118",
             ll="c1.0",
-            opts="Co2L1",
+            opts="Co2L",
             planning_horizons="2030",
-            sopts="720H",
+            sopts="12H",
             discountrate=0.071,
             demand="AP",
             h2export="0",
+            esc="shipping_lnh3",
         )
 
     n0 = pypsa.Network(snakemake.input.network)
@@ -50,7 +52,7 @@ if __name__ == "__main__":
 
 # %%
 # def summary_h2(n, t):
-t = 720
+t = 12
 
 n = n0.copy()
 # n = pypsa.Network("../results/MA_REALISTIC_2030/postnetworks/elec_s_195_ec_lc1.0_Co2L_3H_2030_0.071_AP_428export.nc")
@@ -113,7 +115,7 @@ def populate_db(tech_col, carrier, flow, tech, ngv=False):  # TODO Add scenario 
         elif ngv == False:
             dbf["value"] = abs(dbf["value"])
 
-    db = db.append(dbf)
+    db = pd.concat([db,dbf])
 
 
 def add_gen(tech, carrier, reg=False):
@@ -230,7 +232,7 @@ def net_flow(co_code, tech, carrier, flow):
     dbf["flow"] = flow
     dbf["tech"] = tech
     dbf["value"] = (inflow - outflow).reset_index(drop=True)  # /10**6
-    db = db.append(dbf)
+    db = pd.concat([db,dbf])
     return dbf
 
 
@@ -436,6 +438,7 @@ yearly_agg = round(db.groupby([db.node_id, db.carrier, db.flow, db.tech]).sum() 
 
 # yearly_agg.to_csv('summary_db.csv')
 # yearly_agg.to_csv(snakemake.output.yr_agg)
+print("aye 7aga")
 # %%
 def calc_energy_flow(carrier, node_id):
     agg = yearly_agg.reset_index()

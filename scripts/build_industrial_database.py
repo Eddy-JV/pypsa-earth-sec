@@ -506,13 +506,13 @@ if __name__ == "__main__":
         snakemake = mock_snakemake(
             "build_industrial_database",
             simpl="",
-            clusters="4",
+            clusters="102",
             ll="c1.0",
             opts="Co2L",
             planning_horizons="2030",
-            sopts="144H",
+            sopts="12H",
             discountrate="0.071",
-            demand="DF",
+            demand="AP",
         )
     industrial_database_steel = create_steel_db()
     industrial_database_cement = create_cement_db()
